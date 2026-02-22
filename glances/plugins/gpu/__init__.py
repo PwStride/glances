@@ -14,16 +14,26 @@ Currently supported:
 - AMD GPU (no lib needed)
 - Intel GPU (no lib needed)
 
+Features:
+- Real-time GPU monitoring (utilization, memory, temperature)
+- Performance monitoring and failure prediction
+- Desktop notifications for critical GPU states
+
 Quick test:
 - Start Glances
 - In a terminal: vblank_mode=0 glxgears
 """
 
+from time import time
+
 from glances.globals import to_fahrenheit
+from glances.gpu_list import glances_gpu
 from glances.logger import logger
+from glances.plugins.gpu.analyzer import GpuPerformanceAnalyzer
 from glances.plugins.gpu.cards.amd import AmdGPU
 from glances.plugins.gpu.cards.intel import IntelGPU
 from glances.plugins.gpu.cards.nvidia import NvidiaGPU
+from glances.plugins.gpu.notifier import GpuNotifier
 from glances.plugins.plugin.model import GlancesPluginModel
 
 # Fields description
@@ -105,8 +115,76 @@ class GpuPlugin(GlancesPluginModel):
         # Just for test purpose (uncomment to test on computer without Intel GPU)
         # self.intel = IntelGPU(drm_root_folder='./tests-data/plugins/gpu/intel/sys/class/drm')
 
+        # Init performance monitoring (failure prediction)
+        self._init_performance_monitoring(config)
+
         # We want to display the stat in the curse interface
         self.display_curse = True
+
+    def _init_performance_monitoring(self, config):
+        """Initialize GPU performance monitoring and failure prediction."""
+        # Load performance monitoring configuration
+        self.enable_performance_monitoring = self._get_perf_config(
+            config, 'enable_performance_monitoring', default=True, as_bool=True
+        )
+
+        if not self.enable_performance_monitoring:
+            self.analyzer = None
+            self.notifier = None
+            self.performance_stats = []
+            return
+
+        # Load analyzer configuration
+        temp_critical = self._get_perf_config(config, 'temp_critical', default=85.0)
+        temp_warning = self._get_perf_config(config, 'temp_warning', default=80.0)
+        temp_history_size = int(self._get_perf_config(config, 'temp_history_size', default=20))
+        prediction_window = self._get_perf_config(config, 'prediction_window', default=180)
+        high_load_temp = self._get_perf_config(config, 'high_load_temp', default=75.0)
+        high_load_proc = self._get_perf_config(config, 'high_load_proc', default=85.0)
+        high_load_duration = self._get_perf_config(config, 'high_load_duration', default=120)
+
+        # Initialize analyzer
+        try:
+            self.analyzer = GpuPerformanceAnalyzer(
+                temp_critical_threshold=temp_critical,
+                temp_warning_threshold=temp_warning,
+                temp_history_size=temp_history_size,
+                prediction_window=prediction_window,
+                high_load_temp_threshold=high_load_temp,
+                high_load_proc_threshold=high_load_proc,
+                high_load_warning_duration=high_load_duration,
+            )
+        except Exception as e:
+            logger.error(f"Failed to initialize GPU performance analyzer: {e}")
+            self.analyzer = None
+
+        # Load notifier configuration
+        enable_notifications = self._get_perf_config(config, 'enable_notifications', default=True, as_bool=True)
+        notification_cooldown = self._get_perf_config(config, 'notification_cooldown', default=300)
+
+        # Initialize notifier
+        if enable_notifications:
+            try:
+                self.notifier = GpuNotifier(cooldown_period=notification_cooldown)
+            except Exception as e:
+                logger.error(f"Failed to initialize GPU notifier: {e}")
+                self.notifier = None
+        else:
+            self.notifier = None
+
+        # Performance stats storage
+        self.performance_stats = []
+
+    def _get_perf_config(self, config, key, default, as_bool=False):
+        """Get performance monitoring configuration value."""
+        if config is None:
+            return default
+
+        if as_bool:
+            return config.get_bool_value('gpu', key, default=default)
+
+        value = config.get_float_value('gpu', key, default=default)
+        return value if value is not None else default
 
     def exit(self):
         """Overwrite the exit method to close the GPU API."""
@@ -174,7 +252,51 @@ class GpuPlugin(GlancesPluginModel):
         # Update the stats
         self.stats = stats
 
+        # Publish to global GPU registry
+        glances_gpu.set(stats)
+
+        # Run performance monitoring and failure prediction
+        self._update_performance_monitoring()
+
         return self.stats
+
+    def _update_performance_monitoring(self):
+        """Update performance monitoring and failure prediction."""
+        if not self.enable_performance_monitoring or self.analyzer is None:
+            self.performance_stats = []
+            return
+
+        # Analyze each GPU for potential failures
+        current_time = time()
+        self.performance_stats = []
+
+        for gpu in self.stats:
+            try:
+                analysis = self.analyzer.analyze_gpu(gpu, current_time)
+                if analysis:
+                    self.performance_stats.append(analysis)
+
+                    # Send notification if needed
+                    if self.notifier and analysis['status'] in ('WARNING', 'CRITICAL', 'ERROR'):
+                        try:
+                            self.notifier.send_notification(
+                                analysis['gpu_id'], analysis['status'], analysis['prediction'], current_time
+                            )
+                        except Exception as e:
+                            logger.debug(f"Failed to send notification for GPU {analysis['gpu_id']}: {e}")
+            except Exception as e:
+                gpu_id = gpu.get('gpu_id', 'unknown')
+                logger.error(f"Failed to analyze GPU {gpu_id}: {e}")
+                error_stat = {
+                    'gpu_id': gpu_id,
+                    'name': gpu.get('name', 'Unknown'),
+                    'status': 'ERROR',
+                    'prediction': f'Analysis failed: {str(e)}',
+                    'temp_trend': 0.0,
+                    'time_to_critical': None,
+                    'high_load_duration': 0,
+                }
+                self.performance_stats.append(error_stat)
 
     def update_views(self):
         """Update stats views."""
@@ -322,4 +444,51 @@ class GpuPlugin(GlancesPluginModel):
         else:
             self._msg_curse_multi(ret)
 
+        # Add performance monitoring warnings if enabled
+        self._msg_curse_performance_monitoring(ret)
+
         return ret
+
+    def _msg_curse_performance_monitoring(self, ret):
+        """Add performance monitoring warnings to the curse output."""
+        if not self.enable_performance_monitoring or not self.performance_stats:
+            return
+
+        # Filter for GPUs with warnings, critical states, or errors
+        alerts = [stat for stat in self.performance_stats if stat['status'] in ('WARNING', 'CRITICAL', 'ERROR')]
+
+        if not alerts:
+            return
+
+        # Add separator
+        ret.append(self.curse_new_line())
+
+        # Display each alert
+        for alert in alerts:
+            ret.append(self.curse_new_line())
+
+            # Status indicator with color
+            status = alert['status']
+            if status == 'CRITICAL':
+                decoration = 'CRITICAL'
+                indicator = '⚠️ '
+            elif status == 'WARNING':
+                decoration = 'WARNING'
+                indicator = '⚡'
+            else:  # ERROR
+                decoration = 'CRITICAL'
+                indicator = '❌'
+
+            # GPU identifier
+            ret.append(self.curse_add_line(f'{indicator} {alert["gpu_id"]}: ', decoration))
+
+            # Prediction message (truncated if too long)
+            message = alert['prediction']
+            if len(message) > 50:
+                message = message[:47] + '...'
+            ret.append(self.curse_add_line(message))
+
+            # Show time to critical if available and not in error state
+            if alert['status'] != 'ERROR' and alert.get('time_to_critical') and alert['time_to_critical'] > 0:
+                ret.append(self.curse_new_line())
+                ret.append(self.curse_add_line(f"   Critical in ~{int(alert['time_to_critical'])}s"))
