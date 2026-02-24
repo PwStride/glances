@@ -18,6 +18,7 @@ _plugins_graph = {
     'programlist': ['processcount'],
     'quicklook': ['fs', 'load'],
     'vms': ['processcount'],
+    'gaming_performance': ['processlist', 'gpu'],  # Gaming performance depends on processlist and gpu
 }
 
 
