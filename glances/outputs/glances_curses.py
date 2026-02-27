@@ -126,6 +126,7 @@ class _GlancesCurses:
         'smart',
         'sensors',
         'now',
+        'cpu_chart',
     ]
     _left_sidebar_min_width = 23
     _left_sidebar_max_width = 34
@@ -543,6 +544,29 @@ class _GlancesCurses:
 
             # Get the view
             ret[p] = stats.get_plugin(p).get_stats_display(args=self.args, max_width=plugin_max_width)
+
+        # Inject the CPU chart display entry.  The chart lives inside the cpu
+        # plugin (glances/plugins/cpu/chart.py) rather than a separate plugin
+        # directory, so it is not auto-discovered by the plugin loader.  We
+        # build its stat_display entry here using the cpu plugin's dedicated
+        # msg_curse_chart method so that it can be rendered in the left sidebar
+        # under the 'cpu_chart' slot.
+        if 'cpu_chart' in self._left_sidebar:
+            cpu_plugin = stats.get_plugin('cpu')
+            if cpu_plugin is not None:
+                chart_max_width = min(
+                    self._left_sidebar_max_width,
+                    max(self._left_sidebar_min_width, self.term_window.getmaxyx()[1] - 105),
+                )
+                ret['cpu_chart'] = {
+                    'display': True,
+                    'msgdict': cpu_plugin.msg_curse_chart(args=self.args, max_width=chart_max_width),
+                    'align': 'left',
+                }
+                # Ensure the args namespace has the disable flag that __display_left
+                # requires; the plugin loader normally sets this for real plugins.
+                if not hasattr(self.args, 'disable_cpu_chart'):
+                    setattr(self.args, 'disable_cpu_chart', False)
 
         return ret
 

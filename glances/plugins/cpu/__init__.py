@@ -12,8 +12,11 @@ import psutil
 
 from glances.cpu_percent import cpu_percent
 from glances.globals import LINUX, SUNOS, WINDOWS
+from glances.logger import logger
 from glances.plugins.core import CorePlugin
+from glances.plugins.cpu.chart import CpuChart, mhz_to_hz
 from glances.plugins.plugin.model import GlancesPluginModel
+from glances.processes import glances_processes
 
 # Fields description
 # https://github.com/nicolargo/glances/wiki/How-to-create-a-new-plugin-%3F#create-the-plugin-script
@@ -114,6 +117,14 @@ another while ensuring that the tasks do not conflict.',
     },
     'cpucore': {'description': 'Total number of CPU core.', 'unit': 'number'},
     'time_since_update': {'description': 'Number of seconds since last update.', 'unit': 'seconds'},
+    # Chart-specific fields
+    'cpu_name': {'description': 'CPU model name.'},
+    'cpu_hz_current': {'description': 'Current CPU frequency.', 'unit': 'hertz'},
+    'cpu_hz': {'description': 'Maximum CPU frequency.', 'unit': 'hertz'},
+    'cpu_log_core': {'description': 'Number of logical CPU cores.', 'unit': 'number'},
+    'cpu_phys_core': {'description': 'Number of physical CPU cores.', 'unit': 'number'},
+    'processes': {'description': 'Total number of processes.', 'unit': 'number'},
+    'threads': {'description': 'Total number of threads.', 'unit': 'number'},
 }
 
 # SNMP OID
@@ -141,6 +152,7 @@ snmp_oid = {
 items_history_list = [
     {'name': 'user', 'description': 'User CPU usage', 'y_unit': '%'},
     {'name': 'system', 'description': 'System CPU usage', 'y_unit': '%'},
+    {'name': 'total', 'description': 'Total CPU usage', 'y_unit': '%'},
 ]
 
 
@@ -165,6 +177,12 @@ class CpuPlugin(GlancesPluginModel):
             self.nb_log_core = CorePlugin(args=self.args).update()["log"]
         except Exception:
             self.nb_log_core = 1
+
+        # Maximum number of per-core rows to show in the chart table
+        self._chart_max_cpu_display = config.get_int_value('cpu', 'chart_max_cpu_display', 8) if config else 8
+
+        # Chart display helper (instantiated once, reused every refresh)
+        self._chart = CpuChart(self)
 
     @GlancesPluginModel._check_decorator
     @GlancesPluginModel._log_result_decorator
@@ -228,6 +246,46 @@ class CpuPlugin(GlancesPluginModel):
         stats.update(self.filter_stats(cpu_stats))
         # Core number is needed to compute the CTX switch limit
         stats['cpucore'] = self.nb_log_core
+
+        # ── Chart extra fields ────────────────────────────────────────────
+        # Per-core CPU usage list
+        stats['percpu'] = cpu_percent.get_percpu()
+
+        # CPU name and frequency (cached, refreshed every 2x update interval)
+        cpu_info = cpu_percent.get_info()
+        stats['cpu_name'] = cpu_info['cpu_name']
+        stats['cpu_hz_current'] = (
+            mhz_to_hz(cpu_info['cpu_hz_current']) if cpu_info['cpu_hz_current'] is not None else None
+        )
+        stats['cpu_hz'] = (
+            mhz_to_hz(cpu_info['cpu_hz']) if cpu_info['cpu_hz'] is not None else None
+        )
+
+        # Physical and logical core counts
+        try:
+            stats['cpu_phys_core'] = psutil.cpu_count(logical=False)
+            stats['cpu_log_core'] = psutil.cpu_count(logical=True)
+        except Exception as e:
+            logger.debug(f'cpu: could not get core count ({e})')
+            stats['cpu_phys_core'] = None
+            stats['cpu_log_core'] = None
+
+        # Process and thread counts
+        try:
+            proc_count = glances_processes.get_count()
+            stats['processes'] = proc_count.get('total', 0)
+            stats['threads'] = proc_count.get('thread', 0)
+            stats['running'] = proc_count.get('running', 0)
+            stats['sleeping'] = proc_count.get('sleeping', 0)
+        except Exception as e:
+            logger.debug(f'cpu: could not get process count ({e})')
+            stats['processes'] = None
+            stats['threads'] = None
+            stats['running'] = None
+            stats['sleeping'] = None
+
+        # Expose chart display config so CpuChart can read it without a separate config reference
+        stats['chart_max_cpu_display'] = self._chart_max_cpu_display
 
         return stats
 
@@ -372,3 +430,17 @@ class CpuPlugin(GlancesPluginModel):
 
         # Return the message with decoration
         return ret
+
+    def msg_curse_chart(self, args=None, max_width=None):
+        """Return the chart section display list for the CPU plugin.
+
+        Called by the curses output layer when the 'cpu' plugin is rendered
+        in the left sidebar (chart view).  Delegates to the CpuChart helper
+        defined in glances/plugins/cpu/chart.py.
+        """
+        if not self.stats or self.is_disabled():
+            return []
+        if not max_width:
+            logger.debug(f'No max_width defined for the {self.plugin_name} chart, it will not be displayed.')
+            return []
+        return self._chart.msg_curse(max_width)
