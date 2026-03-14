@@ -136,6 +136,11 @@ Examples of use:
         # Should be set to True to generate graphs
         self.args.generate_graph = False
 
+        # Init the save_snapshot tag for the system_comparison plugin.
+        # Flipped to True by the 'y' hotkey; the plugin performs the save
+        # and resets the flag on the next update cycle.
+        self.args.save_snapshot = False
+
         # Export is only available in standalone or client mode (issue #614)
         export_tag = self.args.export is not None and any(self.args.export)
         if WINDOWS and export_tag:

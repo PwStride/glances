@@ -92,6 +92,8 @@ class _GlancesCurses:
         'w': {'handler': '_handle_clean_logs'},
         'W': {'switch': 'disable_wifi'},
         'x': {'handler': '_handle_clean_critical_logs'},
+        'y': {'switch': 'save_snapshot'},
+        'Y': {'switch': 'disable_system_comparison'},
         'z': {'handler': '_handle_disable_process'},
         '+': {'handler': '_handle_increase_nice'},
         '-': {'handler': '_handle_decrease_nice'},
@@ -125,6 +127,7 @@ class _GlancesCurses:
         'raid',
         'smart',
         'sensors',
+        'system_comparison',
         'now',
         'cpu_chart',
     ]
@@ -674,6 +677,12 @@ class _GlancesCurses:
             else:
                 logger.warning('Graph export module is disable. Run Glances with --export graph to enable it.')
                 self.args.generate_graph = False
+
+        # Display snapshot-save popup. The flag is cleared by the
+        # system_comparison plugin on the next update() tick, so this
+        # popup flashes once while the save is in flight.
+        if getattr(self.args, 'save_snapshot', False):
+            self.display_popup('Saving baseline snapshot...')
 
         return True
 
